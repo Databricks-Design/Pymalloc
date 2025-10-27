@@ -1,0 +1,70 @@
+# Final Analysis of NER Pipeline Memory Patterns
+
+Your graphs and data table capture a complex but predictable interaction between three distinct memory systems. The confusion arises because you are seeing two different types of growth (from spaCy) and one type of de-allocation (from CPython).
+
+Here is the straightforward breakdown of each event.
+
+---
+
+## 1. The "Mega-Steps" (50-100MB+ Jumps)
+
+This is the dominant pattern in your Graph 2 and in the first ~8,000 batches of Graph 1.
+
+**What It Is:** spaCy.StringStore (PreshMap) Hash Table Resizing.
+
+**Mechanism:** spaCy.StringStore is a high-speed hash table. To stay fast, it must resize when it gets too full.
+
+- **Trigger:** It hits its 60% load factor (the resize condition `if (map_.filled + 1) * 5 >= (map_.cells.size() * 3)` means load factor ≥ 0.6).
+- **Action:** It allocates a new table 2x the size (the table size must be a power of two, so it doubles: 8→16→32→64... and so on), then copies all data to the new table.
+- **Result:** This single, massive malloc call is the 50-100MB "step-up" you see.
+
+**Why It Happens:** This is your "High-Discovery" phase. Your pipeline is seeing thousands of new, unique strings (Twitter hashtags, URLs, usernames) very fast, forcing the StringStore to double its size repeatedly.
+
+---
+
+## 2. The "Nano-Growth" (Slow, Linear Slope)
+
+This is the pattern in Graph 1 after batch ~8,000.
+
+**What It Is:** Lexeme Cache Accumulation.
+
+**Mechanism:** After ~8,000 batches, the StringStore has finished its large resizes and is stable. However, your pipeline still encounters new, rare, or misspelled words.
+
+- **Trigger:** A new, unique word is seen.
+- **Action:** spaCy creates a Lexeme object (a struct containing ~20 fields like orth, prob, cluster, lower, norm, shape, prefix, suffix - approximately 200-300 bytes) and adds it to the nlp.vocab cache.
+- **Result:** This is not an exponential doubling, but a slow, steady, additive growth. The accumulation of thousands of these small Lexeme objects creates the "nano-growth" slope.
+
+**Why It Happens:** The lexeme cache grows as texts are processed and new tokens are seen. The lexeme cache is just for speed, but continues to accumulate as long as new vocabulary is encountered.
+
+---
+
+## 3. The "Step-Down" (Small Memory Drop)
+
+This is the event visible around batch ~8,000 in Graph 1.
+
+**What It Is:** CPython pymalloc Arena Release.
+
+**Mechanism:** This event is not a spaCy function. It is CPython's underlying memory manager.
+
+- **Trigger:** Python's Garbage Collector (GC) runs periodically in the background. It found a block of memory (an "Arena" - pymalloc's 256KB memory blocks) that was 100% empty (i.e., all objects in it were temporary and had been freed).
+- **Action:** pymalloc returned this unused memory block to the Operating System.
+- **Result:** Your process's total memory (RSS) instantly dropped.
+
+**Proof:** This occurs right at the transition point where StringStore resizing stops. The temporary objects from the resize operations (old table copies, rehashing intermediates) get freed by GC, allowing pymalloc to reclaim entire arenas and return them to the OS.
+
+---
+
+## Conclusion: The Complete Story
+
+Your graphs show the full lifecycle of the pipeline:
+
+- **Batches 0 - 8,000:** A "High-Discovery" phase dominated by StringStore resizing ("mega-steps").
+- **Around Batch 8,000:** A pymalloc "step-down" event happens, proving CPython's allocator is also at work.
+- **Batches 8,000 - 36,000:** A "Steady-State" phase where the StringStore is stable, but a new, slower growth from Lexeme accumulation ("nano-growth") takes over.
+
+**The memory_zone (green line) is the correct solution because it solves both spaCy growth problems:**
+
+- It clears transient strings after each batch using the memory zone context manager, so the StringStore never hits 60% (no "mega-steps").
+- It invalidates and frees transient Lexeme objects created within the memory zone, so the Vocab never accumulates (no "nano-growth").
+
+The result: A stable, production-ready NER pipeline with constant memory usage.
