@@ -1,13 +1,20 @@
+#!/usr/bin/env python3
+
+import os
 import pandas as pd
 import json
 from typing import Any, Dict, List, Tuple
-import os
-from multiprocessing import Pool, cpu_count
+import glob
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
+import multiprocessing as mp
+
+warnings.filterwarnings('ignore')
 
 def normalize_json(obj: Any) -> Any:
     """
-    Recursively normalize JSON structure for order-independent comparison.
-    Sorts dictionary keys and list elements for deterministic comparison.
+    Recursively normalize JSON structure for comparison.
     """
     if isinstance(obj, dict):
         return {k: normalize_json(v) for k, v in sorted(obj.items())}
@@ -22,15 +29,15 @@ def normalize_json(obj: Any) -> Any:
 
 def parse_outputs_json(value: Any) -> Dict:
     """
-    Parse outputs_json column stored as JSON string.
-    Returns parsed dictionary or empty dict if invalid.
+    Parse outputs_json column which can be string or dict.
     """
     if pd.isna(value) or value == '' or value == '{}':
         return {}
     
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
         except:
             return {}
     elif isinstance(value, dict):
@@ -39,59 +46,10 @@ def parse_outputs_json(value: Any) -> Dict:
         return {}
 
 
-def find_differences(obj1: Any, obj2: Any, path: str = "root") -> List[str]:
-    """
-    Recursively find all differences between two objects.
-    Works with any JSON structure without knowing schema in advance.
-    Checks all keys, values, types, array lengths at all nesting levels.
-    """
-    differences = []
-    
-    if type(obj1) != type(obj2):
-        differences.append(f"{path}: type(obj1)={type(obj1).__name__}, type(obj2)={type(obj2).__name__}")
-        return differences
-    
-    if isinstance(obj1, dict):
-        all_keys = set(obj1.keys()) | set(obj2.keys())
-        
-        for key in sorted(all_keys):
-            new_path = f"{path}.{key}"
-            
-            if key not in obj1:
-                differences.append(f"{new_path}: Key only in API_2")
-            elif key not in obj2:
-                differences.append(f"{new_path}: Key only in API_1")
-            else:
-                differences.extend(find_differences(obj1[key], obj2[key], new_path))
-    
-    elif isinstance(obj1, list):
-        if len(obj1) != len(obj2):
-            differences.append(f"{path}: Length mismatch - len(API_1)={len(obj1)}, len(API_2)={len(obj2)}")
-        
-        min_len = min(len(obj1), len(obj2))
-        for i in range(min_len):
-            new_path = f"{path}[{i}]"
-            differences.extend(find_differences(obj1[i], obj2[i], new_path))
-        
-        if len(obj1) > len(obj2):
-            for i in range(len(obj2), len(obj1)):
-                differences.append(f"{path}[{i}]: Extra element in API_1")
-        elif len(obj2) > len(obj1):
-            for i in range(len(obj1), len(obj2)):
-                differences.append(f"{path}[{i}]: Extra element in API_2")
-    
-    else:
-        if obj1 != obj2:
-            differences.append(f"{path}: API_1={repr(obj1)}, API_2={repr(obj2)}")
-    
-    return differences
-
-
 def compare_outputs(output1: Dict, output2: Dict) -> Tuple[bool, str]:
     """
-    Compare two output JSON objects using normalization first.
-    Same approach as previous testing framework.
-    Returns (is_match, detailed_comment)
+    Compare two outputs_json values.
+    Returns: (is_match, comment)
     """
     norm1 = normalize_json(output1)
     norm2 = normalize_json(output2)
@@ -99,166 +57,309 @@ def compare_outputs(output1: Dict, output2: Dict) -> Tuple[bool, str]:
     if norm1 == norm2:
         return True, "MATCH"
     
-    differences = find_differences(output1, output2)
+    comments = []
     
-    if not differences:
-        differences = ["Structures differ but no specific difference detected"]
+    # Deep comparison to find differences
+    def find_diff(obj1, obj2, path="root"):
+        diffs = []
+        
+        if type(obj1) != type(obj2):
+            diffs.append(f"{path}: type mismatch")
+            return diffs
+        
+        if isinstance(obj1, dict):
+            all_keys = set(obj1.keys()) | set(obj2.keys())
+            for key in sorted(all_keys):
+                if key not in obj1:
+                    diffs.append(f"{path}.{key}: only in api_2")
+                elif key not in obj2:
+                    diffs.append(f"{path}.{key}: only in api_1")
+                else:
+                    diffs.extend(find_diff(obj1[key], obj2[key], f"{path}.{key}"))
+        
+        elif isinstance(obj1, list):
+            if len(obj1) != len(obj2):
+                diffs.append(f"{path}: length mismatch (api_1={len(obj1)}, api_2={len(obj2)})")
+            
+            for i in range(min(len(obj1), len(obj2))):
+                diffs.extend(find_diff(obj1[i], obj2[i], f"{path}[{i}]"))
+            
+            if len(obj1) > len(obj2):
+                for i in range(len(obj2), len(obj1)):
+                    diffs.append(f"{path}[{i}]: extra in api_1")
+            elif len(obj2) > len(obj1):
+                for i in range(len(obj1), len(obj2)):
+                    diffs.append(f"{path}[{i}]: extra in api_2")
+        
+        else:
+            if obj1 != obj2:
+                diffs.append(f"{path}: api_1={repr(obj1)}, api_2={repr(obj2)}")
+        
+        return diffs
     
-    comment = " | ".join(differences[:5])
-    if len(differences) > 5:
-        comment += f" | ... and {len(differences) - 5} more differences"
+    comments = find_diff(output1, output2)
     
-    return False, comment
+    return False, " | ".join(comments[:5]) if comments else "Structure mismatch"
 
 
-def compare_single_row(args: Tuple[int, pd.Series, pd.Series]) -> Dict:
+def verify_same_input_data(df_api1: pd.DataFrame, df_api2: pd.DataFrame) -> Tuple[bool, str]:
     """
-    Compare a single transaction row.
-    Designed for parallel processing with multiprocessing.
+    Verify that both dataframes contain the same input data.
     """
-    idx, row1, row2 = args
+    if len(df_api1) != len(df_api2):
+        return False, f"Different number of rows: api_1={len(df_api1)}, api_2={len(df_api2)}"
     
-    output1 = parse_outputs_json(row1['outputs_json'])
-    output2 = parse_outputs_json(row2['outputs_json'])
+    if 'transaction_id' in df_api1.columns and 'transaction_id' in df_api2.columns:
+        ids_match = (df_api1['transaction_id'].astype(str) == df_api2['transaction_id'].astype(str)).all()
+        if not ids_match:
+            return False, "Transaction IDs don't match - files may not be aligned"
     
-    is_match, comment = compare_outputs(output1, output2)
+    if 'description' in df_api1.columns and 'description' in df_api2.columns:
+        desc_match = (df_api1['description'].astype(str) == df_api2['description'].astype(str)).all()
+        if not desc_match:
+            return False, "Descriptions don't match - files may not be aligned"
     
-    return {
-        'transaction_id': row1['transaction_id'],
-        'description': row1['description'],
-        'memo': row1['memo'],
-        'api_1_output': row1['outputs_json'],
-        'api_2_output': row2['outputs_json'],
-        'match_status': "MATCH" if is_match else "MISMATCH",
-        'comment': comment
+    return True, "Input data verified as identical"
+
+
+def compare_csv_files(file_pair: Tuple[str, str, int]) -> Tuple[pd.DataFrame, int, Dict]:
+    """
+    Compare two CSV files and return comparison dataframe.
+    """
+    api1_csv, api2_csv, part_num = file_pair
+    
+    print(f"  [Part {part_num}] Starting comparison...")
+    
+    df_api1 = pd.read_csv(api1_csv, keep_default_na=False, low_memory=False, dtype={'outputs_json': str})
+    df_api2 = pd.read_csv(api2_csv, keep_default_na=False, low_memory=False, dtype={'outputs_json': str})
+    
+    is_same, verification_msg = verify_same_input_data(df_api1, df_api2)
+    
+    comparison_data = []
+    
+    for idx in range(max(len(df_api1), len(df_api2))):
+        if idx >= len(df_api1):
+            row_id = df_api2.iloc[idx]['transaction_id']
+            row_desc = df_api2.iloc[idx]['description']
+            comparison_data.append({
+                'transaction_id': row_id,
+                'description': row_desc,
+                'memo': df_api2.iloc[idx]['memo'],
+                'api_1_output': "MISSING ROW",
+                'api_2_output': str(df_api2.iloc[idx].get('outputs_json', '')),
+                'match_status': 'DATA_MISMATCH',
+                'comment': "Row exists only in api_2"
+            })
+        elif idx >= len(df_api2):
+            row_id = df_api1.iloc[idx]['transaction_id']
+            row_desc = df_api1.iloc[idx]['description']
+            comparison_data.append({
+                'transaction_id': row_id,
+                'description': row_desc,
+                'memo': df_api1.iloc[idx]['memo'],
+                'api_1_output': str(df_api1.iloc[idx].get('outputs_json', '')),
+                'api_2_output': "MISSING ROW",
+                'match_status': 'DATA_MISMATCH',
+                'comment': "Row exists only in api_1"
+            })
+        else:
+            row_api1 = df_api1.iloc[idx]
+            row_api2 = df_api2.iloc[idx]
+            
+            row_id_api1 = str(row_api1['transaction_id'])
+            row_id_api2 = str(row_api2['transaction_id'])
+            row_desc_api1 = str(row_api1['description'])
+            row_desc_api2 = str(row_api2['description'])
+            
+            if row_id_api1 != row_id_api2 or row_desc_api1 != row_desc_api2:
+                comparison_data.append({
+                    'transaction_id': f"api_1={row_id_api1}, api_2={row_id_api2}",
+                    'description': row_desc_api1,
+                    'memo': row_api1['memo'],
+                    'api_1_output': "N/A",
+                    'api_2_output': "N/A",
+                    'match_status': 'DATA_MISMATCH',
+                    'comment': "Input data doesn't match - rows are not aligned!"
+                })
+                continue
+            
+            output_api1_raw = row_api1.get('outputs_json', '')
+            output_api2_raw = row_api2.get('outputs_json', '')
+            
+            output_api1 = parse_outputs_json(output_api1_raw)
+            output_api2 = parse_outputs_json(output_api2_raw)
+            
+            is_match, comment = compare_outputs(output_api1, output_api2)
+            
+            output_api1_str = str(output_api1_raw) if output_api1_raw else "{}"
+            output_api2_str = str(output_api2_raw) if output_api2_raw else "{}"
+            
+            comparison_data.append({
+                'transaction_id': row_id_api1,
+                'description': row_desc_api1,
+                'memo': row_api1['memo'],
+                'api_1_output': output_api1_str,
+                'api_2_output': output_api2_str,
+                'match_status': 'MATCH' if is_match else 'MISMATCH',
+                'comment': comment
+            })
+    
+    comparison_df = pd.DataFrame(comparison_data)
+    
+    stats = {
+        'matches': (comparison_df['match_status'] == 'MATCH').sum(),
+        'mismatches': (comparison_df['match_status'] == 'MISMATCH').sum(),
+        'data_mismatches': (comparison_df['match_status'] == 'DATA_MISMATCH').sum(),
+        'verification': verification_msg
     }
+    
+    print(f"  [Part {part_num}] Complete - Matches: {stats['matches']}, Mismatches: {stats['mismatches']}")
+    
+    return comparison_df, part_num, stats
 
 
-def verify_input_alignment(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[bool, str]:
+def compare_all_parts(output_dir: str, use_multiprocessing: bool = True):
     """
-    Verify that both dataframes have identical input data.
-    Critical for ensuring fair comparison.
+    Compare all CSV parts between api_1 and api_2 folders.
     """
-    if len(df1) != len(df2):
-        return False, f"Row count mismatch: api_1={len(df1)}, api_2={len(df2)}"
+    api1_folder = os.path.join(output_dir, "api_1")
+    api2_folder = os.path.join(output_dir, "api_2")
+    comparison_folder = os.path.join(output_dir, "comparison")
     
-    if not df1['transaction_id'].equals(df2['transaction_id']):
-        return False, "Transaction IDs do not match"
+    os.makedirs(comparison_folder, exist_ok=True)
     
-    desc_mismatch = (df1['description'] != df2['description']).sum()
-    if desc_mismatch > 0:
-        return False, f"{desc_mismatch} descriptions do not match"
+    api1_files = sorted(glob.glob(os.path.join(api1_folder, "output_part_*.csv")))
+    api2_files = sorted(glob.glob(os.path.join(api2_folder, "output_part_*.csv")))
     
-    memo_mismatch = (df1['memo'].fillna('') != df2['memo'].fillna('')).sum()
-    if memo_mismatch > 0:
-        return False, f"{memo_mismatch} memos do not match"
-    
-    return True, "Input data aligned correctly"
-
-
-def compare_csv_files():
-    """
-    Main comparison function with multiprocessing support.
-    Loads both API outputs and performs parallel row-by-row comparison.
-    """
-    print("=== Starting Output Comparison ===\n")
-    
-    api1_csv = 'output/api_1/output_part_1.csv'
-    api2_csv = 'output/api_2/output_part_1.csv'
-    
-    print("Loading output files...")
-    df1 = pd.read_csv(api1_csv, dtype={'outputs_json': str})
-    df2 = pd.read_csv(api2_csv, dtype={'outputs_json': str})
-    
-    print(f"API 1: {len(df1)} transactions")
-    print(f"API 2: {len(df2)} transactions")
-    
-    print("\nVerifying input data alignment...")
-    aligned, align_msg = verify_input_alignment(df1, df2)
-    print(f"Alignment check: {align_msg}")
-    
-    if not aligned:
-        print("\nERROR: Input data not aligned. Cannot proceed with comparison.")
+    if not api1_files:
+        print("ERROR: No CSV files found in api_1 folder!")
         return
     
-    print("\nComparing outputs with multiprocessing...")
-    total_rows = len(df1)
+    if not api2_files:
+        print("ERROR: No CSV files found in api_2 folder!")
+        return
     
-    args_list = [
-        (i, df1.iloc[i], df2.iloc[i])
-        for i in range(total_rows)
+    print(f"\nFound {len(api1_files)} files in api_1")
+    print(f"Found {len(api2_files)} files in api_2")
+    
+    if len(api1_files) != len(api2_files):
+        print(f"⚠️ WARNING: Different number of CSV files!")
+    
+    num_pairs = min(len(api1_files), len(api2_files))
+    
+    file_pairs = [
+        (api1_files[i], api2_files[i], i+1)
+        for i in range(num_pairs)
     ]
     
-    num_processes = min(cpu_count(), 8)
-    print(f"Using {num_processes} processes")
-    
-    with Pool(processes=num_processes) as pool:
-        comparison_results = []
-        chunk_size = 1000
+    print(f"\n{'='*80}")
+    if use_multiprocessing:
+        num_workers = max(1, int(mp.cpu_count() * 0.75))
+        print(f"Using multiprocessing with {num_workers} workers")
+        print(f"Processing {num_pairs} file pairs in parallel...")
+        print(f"{'='*80}\n")
         
-        for i in range(0, len(args_list), chunk_size):
-            chunk = args_list[i:i+chunk_size]
-            chunk_results = pool.map(compare_single_row, chunk)
-            comparison_results.extend(chunk_results)
+        all_comparisons = {}
+        all_stats = {}
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_part = {executor.submit(compare_csv_files, pair): pair[2] 
+                             for pair in file_pairs}
             
-            progress = min(i + chunk_size, total_rows)
-            print(f"Progress: {progress}/{total_rows} ({progress/total_rows*100:.1f}%)")
+            for future in as_completed(future_to_part):
+                part_num = future_to_part[future]
+                try:
+                    comparison_df, part_num, stats = future.result()
+                    all_comparisons[part_num] = comparison_df
+                    all_stats[part_num] = stats
+                    
+                except Exception as exc:
+                    print(f"  [Part {part_num}] Generated an exception: {exc}")
+    else:
+        print("Using sequential processing...")
+        print(f"{'='*80}\n")
+        
+        all_comparisons = {}
+        all_stats = {}
+        
+        for pair in file_pairs:
+            comparison_df, part_num, stats = compare_csv_files(pair)
+            all_comparisons[part_num] = comparison_df
+            all_stats[part_num] = stats
     
-    comparison_df = pd.DataFrame(comparison_results)
+    print(f"\n{'='*80}")
+    print("Combining all comparisons...")
     
-    match_count = (comparison_df['match_status'] == 'MATCH').sum()
-    mismatch_count = (comparison_df['match_status'] == 'MISMATCH').sum()
+    ordered_comparisons = [all_comparisons[i] for i in sorted(all_comparisons.keys())]
+    combined_df = pd.concat(ordered_comparisons, ignore_index=True)
     
-    os.makedirs('output/comparison', exist_ok=True)
+    combined_file = os.path.join(comparison_folder, "combined_comparison.csv")
+    combined_df.to_csv(combined_file, index=False)
+    print(f"✓ Saved combined comparison: {combined_file}")
     
-    combined_path = 'output/comparison/combined_comparison.csv'
-    comparison_df.to_csv(combined_path, index=False)
-    print(f"\nSaved: {combined_path}")
+    total_matches = sum(stats['matches'] for stats in all_stats.values())
+    total_mismatches = sum(stats['mismatches'] for stats in all_stats.values())
+    total_data_mismatches = sum(stats['data_mismatches'] for stats in all_stats.values())
     
-    mismatch_df = comparison_df[comparison_df['match_status'] == 'MISMATCH']
-    mismatch_path = 'output/comparison/mismatch_only.csv'
-    mismatch_df.to_csv(mismatch_path, index=False)
-    print(f"Saved: {mismatch_path}")
+    mismatches_df = combined_df[combined_df['match_status'].isin(['MISMATCH', 'DATA_MISMATCH'])]
+    if len(mismatches_df) > 0:
+        mismatches_file = os.path.join(comparison_folder, "mismatch_only.csv")
+        mismatches_df.to_csv(mismatches_file, index=False)
+        print(f"✓ Saved mismatches only: {mismatches_file}")
     
-    match_percentage = (match_count / total_rows) * 100
+    print(f"\n{'='*80}")
+    print("COMPARISON SUMMARY")
+    print(f"{'='*80}")
+    print(f"Total Rows Compared: {len(combined_df)}")
+    print(f"Total Matches: {total_matches} ({total_matches/len(combined_df)*100:.2f}%)")
+    print(f"Total Mismatches: {total_mismatches} ({total_mismatches/len(combined_df)*100:.2f}%)")
     
-    summary_text = f"""
-=== COMPARISON SUMMARY ===
+    if total_data_mismatches > 0:
+        print(f"⚠️ Data Alignment Issues: {total_data_mismatches} ({total_data_mismatches/len(combined_df)*100:.2f}%)")
+    
+    if total_mismatches > 0:
+        print(f"\n✓ Review '{mismatches_file}' to see all {total_mismatches + total_data_mismatches} issues")
+    else:
+        print("\n🎉 PERFECT MATCH! All outputs are identical between api_1 and api_2!")
+    
+    summary_file = os.path.join(comparison_folder, "comparison_summary.txt")
+    with open(summary_file, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("OUTPUT COMPARISON SUMMARY REPORT\n")
+        f.write("="*80 + "\n\n")
+        f.write(f"Total Rows Compared: {len(combined_df)}\n")
+        f.write(f"Total Matches: {total_matches} ({total_matches/len(combined_df)*100:.2f}%)\n")
+        f.write(f"Total Output Mismatches: {total_mismatches} ({total_mismatches/len(combined_df)*100:.2f}%)\n")
+        f.write(f"Total Data Alignment Issues: {total_data_mismatches} ({total_data_mismatches/len(combined_df)*100:.2f}%)\n\n")
+        
+        if total_mismatches > 0:
+            f.write("Top 20 Mismatch Reasons:\n")
+            f.write("-"*80 + "\n")
+            mismatch_df = combined_df[combined_df['match_status'] == 'MISMATCH']
+            if len(mismatch_df) > 0:
+                mismatch_reasons = mismatch_df['comment'].value_counts().head(20)
+                for reason, count in mismatch_reasons.items():
+                    f.write(f"  {count:6d}x - {str(reason)[:200]}\n")
+        
+        if total_data_mismatches > 0:
+            f.write("\n⚠️ CRITICAL: Data alignment issues detected!\n")
+            f.write("This suggests the input data in both tests may not be identical.\n")
+    
+    print(f"\n✓ Saved summary report: {summary_file}")
+    print(f"\n{'='*80}")
 
-Total Transactions: {total_rows}
-Matches: {match_count} ({match_percentage:.2f}%)
-Mismatches: {mismatch_count} ({100 - match_percentage:.2f}%)
 
-Input Data Alignment: {align_msg}
-
-Comparison Method: Normalized deep comparison (schema-independent)
-- Checks all keys at all levels
-- Checks all values recursively
-- Checks all array lengths
-- Checks all types
-- Works with any JSON structure
-
-Files Generated:
-- {combined_path}
-- {mismatch_path}
-
-Status: {"PASS - All outputs match" if mismatch_count == 0 else f"FAIL - {mismatch_count} mismatches found"}
-"""
+def main():
+    OUTPUT_DIR = "./output"
+    USE_MULTIPROCESSING = True
     
-    summary_path = 'output/comparison/comparison_summary.txt'
-    with open(summary_path, 'w') as f:
-        f.write(summary_text)
-    print(f"Saved: {summary_path}")
+    if not os.path.exists(OUTPUT_DIR):
+        print(f"ERROR: Output directory '{OUTPUT_DIR}' not found!")
+        return
     
-    print(summary_text)
-    
-    if mismatch_count > 0:
-        print("\n=== Sample Mismatches (first 5) ===")
-        for i, row in mismatch_df.head(5).iterrows():
-            print(f"\nTransaction {row['transaction_id']}:")
-            print(f"  Description: {row['description'][:60]}...")
-            print(f"  Differences: {row['comment'][:150]}...")
+    compare_all_parts(OUTPUT_DIR, use_multiprocessing=USE_MULTIPROCESSING)
+    print("\nComparison complete!")
 
 
 if __name__ == "__main__":
-    compare_csv_files()
+    main()
