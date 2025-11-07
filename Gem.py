@@ -72,8 +72,8 @@ def extract_axis_info(soup):
         # Now matches "8 PM" or "1:00 AM"
         if re.search(r'(\d+:\d+|\d+)\s*(AM|PM)', text_content, re.IGNORECASE) or \
            re.search(r'\d+:\d+', text_content):
-            axis_info['x_labels'].append(text_content)
-            if x_pos:
+            if x_pos: # Only add if it has a position
+                axis_info['x_labels'].append(text_content)
                 axis_info['x_positions'].append(float(x_pos))
         
         # Check if it's a memory label (e.g., "286.10MB", "0B")
@@ -82,8 +82,8 @@ def extract_axis_info(soup):
             num_match = re.match(r'^([\d.]+)', text_content)
             if num_match:
                 label_value = num_match.group(1) # This will be "286.10" or "0"
-                axis_info['y_labels'].append(label_value)
-                if y_pos:
+                if y_pos: # Only add if it has a position
+                    axis_info['y_labels'].append(label_value)
                     axis_info['y_positions'].append(float(y_pos))
             
     return axis_info
@@ -118,7 +118,7 @@ def find_memory_usage_path(soup):
         if isinstance(class_attr, list):
             class_str = ' '.join(class_attr)
         else:
-            class_str = str(class_str)
+            class_str = str(class_attr)
         
         if d_attr and len(d_attr) > 500:
             if 'curve' in class_str.lower() or 'area' in class_str.lower():
@@ -222,17 +222,23 @@ def create_time_array(x_coords, axis_info):
                  for x in x_coords]
         return np.array(times)
     
-    # --- NEW: Sort labels by their X-position ---
-    # Zip positions and labels together
-    paired_list = list(zip(axis_info['x_positions'], axis_info['x_labels']))
-    # Sort by position (the first item in the tuple)
-    paired_list.sort()
-    # Unzip back into a sorted list of labels
+    # --- NEW: Get UNIQUE labels sorted by X-position ---
+    # This collapses all overlapping labels (e.g., 129 labels)
+    # into the single visible set (e.g., 24 labels)
+    unique_labels_map = {}
+    for x_pos, label in zip(axis_info['x_positions'], axis_info['x_labels']):
+        if x_pos not in unique_labels_map:
+            unique_labels_map[x_pos] = label
+            
+    # Convert map to a list of (pos, label) tuples and sort by position
+    paired_list = sorted(unique_labels_map.items())
+    
+    # Unzip back into a sorted list of *visible* labels
     sorted_labels = [label for pos, label in paired_list]
-    print(f"✓ Sorted time labels: {sorted_labels[:5]}... to ...{sorted_labels[-5:]}")
+    print(f"✓ Found {len(sorted_labels)} unique, sorted time labels (e.g., {sorted_labels[0]}... {sorted_labels[-1]})")
     # --- END NEW ---
 
-    # Parse time labels from the *sorted* list
+    # Parse time labels from the *sorted, unique* list
     times_parsed = []
     for label in sorted_labels:
         t = parse_time_label(label) # Uses new, robust parser
@@ -257,8 +263,8 @@ def create_time_array(x_coords, axis_info):
     
     for time in times_parsed:
         current_hour = time.hour
-        if last_hour != -1 and current_hour < last_hour:
-             # e.g., current is 1 (1 AM) and last was 23 (11 PM)
+        # Check for rollover, e.g., last hour was 23 (11 PM) and current is 1 (1 AM)
+        if last_hour != -1 and current_hour < last_hour and (last_hour - current_hour) > 6:
             current_day_offset += 1 
             print(f"✓ Detected midnight crossing: {last_hour}:00 -> {current_hour}:00")
         
@@ -273,7 +279,7 @@ def create_time_array(x_coords, axis_info):
     start_time = times_parsed[0]
     end_time = times_parsed[-1]
 
-    print(f"Time range: {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}")
+    print(f"Time range: {start_time.strftime('%I:%M %p, %b %d')} to {end_time.strftime('%I:%M %p, %b %d')}")
     
     # Linear interpolation
     total_duration = (end_time - start_time).total_seconds()
@@ -305,7 +311,17 @@ def create_memory_array(y_coords, axis_info):
     """
     Create memory array from y coordinates and axis labels
     """
-    if not axis_info['y_labels'] or len(axis_info['y_labels']) < 2:
+    # --- NEW: Deduplicate Y-labels by position ---
+    unique_y_labels = {}
+    for y_pos, label in zip(axis_info['y_positions'], axis_info['y_labels']):
+        if y_pos not in unique_y_labels:
+            unique_y_labels[y_pos] = label
+    
+    sorted_y_labels = [label for pos, label in sorted(unique_y_labels.items())]
+    print(f"✓ Found {len(sorted_y_labels)} unique y-axis labels.")
+    # --- END NEW ---
+    
+    if not sorted_y_labels or len(sorted_y_labels) < 2:
         # Normalize to 0-1000 MB range
         print("⚠ No y-axis labels found, normalizing to 0-1000 MB")
         y_normalized = (y_coords - y_coords.min()) / (y_coords.max() - y_coords.min())
@@ -313,14 +329,14 @@ def create_memory_array(y_coords, axis_info):
     
     # Parse numeric labels
     y_values = []
-    for label in axis_info['y_labels']:
+    for label in sorted_y_labels:
         try:
             y_values.append(float(label))
         except:
             pass
     
     if len(y_values) < 2:
-        print(f"⚠ Could not parse y-axis labels ({axis_info['y_labels']}), normalizing")
+        print(f"⚠ Could not parse y-axis labels ({sorted_y_labels}), normalizing")
         y_normalized = (y_coords - y_coords.min()) / (y_coords.max() - y_coords.min())
         return y_normalized * 1000
     
@@ -391,13 +407,13 @@ def plot_memory_graphs(html_file):
     # Extract axis information
     print("\n📏 Extracting axis information...")
     axis_info = extract_axis_info(soup)
-    print(f"✓ Found {len(axis_info['x_labels'])} x-axis labels (Note: Skipped day annotations)")
-    print(f"✓ Found {len(axis_info['y_labels'])} y-axis labels")
+    print(f"✓ Found {len(axis_info['x_labels'])} raw x-axis labels (Note: Skipped day annotations)")
+    print(f"✓ Found {len(axis_info['y_labels'])} raw y-axis labels")
     
     if axis_info['x_labels']:
-        print(f"  Time labels: {axis_info['x_labels'][:5]}...")
+        print(f"  Raw Time labels (first 5): {axis_info['x_labels'][:5]}...")
     if axis_info['y_labels']:
-        print(f"  Memory labels: {axis_info['y_labels'][:5]}...")
+        print(f"  Raw Memory labels (first 5): {axis_info['y_labels'][:5]}...")
     
     # Map coordinates
     print("\n🗺️  Mapping coordinates to values...")
@@ -405,7 +421,7 @@ def plot_memory_graphs(html_file):
     
     # Create time and memory arrays
     time_array = create_time_array(x_coords, axis_info) # USES NEW FIXED FUNCTION
-    memory_array = create_memory_array(y_coords, axis_info)
+    memory_array = create_memory_array(y_coords, axis_info) # USES NEW FIXED FUNCTION
     
     print(f"✓ Data prepared: {len(time_array)} points")
     print(f"  Memory range: {memory_array.min():.2f} - {memory_array.max():.2f} MB")
