@@ -38,7 +38,12 @@ def parse_svg_path_data(d_attribute):
 def extract_axis_info(soup):
     """
     Extract x-axis and y-axis information from SVG text elements
-    FIXED: Now handles "7 PM" format and "286.10MB" format
+    Uses the exact structure from recharts: 
+    <g class="recharts-layer recharts-cartesian-axis-tick">
+      <text orientation="bottom/left">
+        <tspan>label</tspan>
+      </text>
+    </g>
     """
     axis_info = {
         'x_labels': [],
@@ -47,27 +52,56 @@ def extract_axis_info(soup):
         'y_positions': []
     }
     
-    # Find all text elements
-    for text_elem in soup.find_all('text'):
-        text_content = text_elem.get_text(strip=True)
+    # Find all axis tick groups
+    tick_groups = soup.find_all('g', class_=lambda x: x and 'recharts-cartesian-axis-tick' in x)
+    
+    for tick_group in tick_groups:
+        # Get the text element
+        text_elem = tick_group.find('text')
+        if not text_elem:
+            continue
         
-        # Get position if available
+        # Check orientation to determine if x-axis or y-axis
+        orientation = text_elem.get('orientation', '')
+        
+        # Get the tspan which contains the actual label
+        tspan = text_elem.find('tspan')
+        if not tspan:
+            # Fallback to text content if no tspan
+            label = text_elem.get_text(strip=True)
+        else:
+            label = tspan.get_text(strip=True)
+        
+        if not label:
+            continue
+        
+        # Get positions from text element
         x_pos = text_elem.get('x')
         y_pos = text_elem.get('y')
         
-        # FIXED: Check for time labels - now handles "7 PM" format (no colon needed)
-        # Matches: "7 PM", "12 AM", "6:30 PM", etc.
-        if re.search(r'\d+\s*(AM|PM|am|pm)', text_content) or re.search(r'\d+:\d+', text_content):
-            axis_info['x_labels'].append(text_content)
+        # Determine axis based on orientation attribute
+        if orientation == 'bottom':
+            # X-axis (time labels)
+            axis_info['x_labels'].append(label)
             if x_pos:
                 axis_info['x_positions'].append(float(x_pos))
-        
-        # FIXED: Check for memory labels - now handles "286.10MB" format
-        # Matches: "286.10MB", "500MB", "0B", or plain numbers
-        elif re.search(r'\d+\.?\d*\s*(MB|GB|KB|B|mb|gb|kb)', text_content, re.IGNORECASE) or re.match(r'^\d+(\.\d+)?$', text_content):
-            axis_info['y_labels'].append(text_content)
+        elif orientation == 'left' or orientation == 'right':
+            # Y-axis (memory labels)
+            axis_info['y_labels'].append(label)
             if y_pos:
                 axis_info['y_positions'].append(float(y_pos))
+        else:
+            # Fallback: determine by content if no orientation
+            # Time labels contain AM/PM or colon
+            if re.search(r'\d+\s*(AM|PM|am|pm)', label) or re.search(r'\d+:\d+', label):
+                axis_info['x_labels'].append(label)
+                if x_pos:
+                    axis_info['x_positions'].append(float(x_pos))
+            # Memory labels contain MB/GB/KB or are plain numbers
+            elif re.search(r'\d+\.?\d*\s*(MB|GB|KB|B|mb|gb|kb)', label, re.IGNORECASE) or re.match(r'^\d+(\.\d+)?$', label):
+                axis_info['y_labels'].append(label)
+                if y_pos:
+                    axis_info['y_positions'].append(float(y_pos))
     
     return axis_info
 
