@@ -42,7 +42,7 @@ class APITester:
     def parse_tensor_response(self, response_json: Dict) -> List[Dict]:
         """
         De-batch the flattened tensor response into per-transaction JSON objects.
-        Preserves datatype and shape fields. Converts shape from [batch_size, max_entities] to [1, max_entities].
+        Preserves datatype and shape fields. Keeps empty strings only if data has non-empty values.
         """
         outputs = response_json.get('outputs', [])
         if not outputs:
@@ -54,7 +54,6 @@ class APITester:
         
         batch_size, max_entities = shape
         
-        # Extract all output arrays with metadata
         output_list = []
         for output in outputs:
             output_list.append({
@@ -63,7 +62,6 @@ class APITester:
                 'data': output['data']
             })
         
-        # De-flatten: extract per-transaction data
         results = []
         for i in range(batch_size):
             transaction_outputs = []
@@ -71,15 +69,15 @@ class APITester:
             for output_info in output_list:
                 transaction_data = []
                 
-                # Extract entities for this transaction
                 for j in range(max_entities):
                     idx = i * max_entities + j
                     value = output_info['data'][idx] if idx < len(output_info['data']) else ""
                     transaction_data.append(value)
                 
-                # Remove trailing empty strings to match API format
-                while transaction_data and transaction_data[-1] == "":
-                    transaction_data.pop()
+                has_non_empty = any(val != "" for val in transaction_data)
+                
+                if not has_non_empty:
+                    transaction_data = []
                 
                 transaction_outputs.append({
                     "name": output_info['name'],
@@ -88,7 +86,6 @@ class APITester:
                     "data": transaction_data
                 })
             
-            # Build complete per-transaction JSON
             transaction_json = {
                 "model_name": response_json.get('model_name', ''),
                 "model_version": response_json.get('model_version', ''),
@@ -223,7 +220,7 @@ class APITester:
 def print_sample_outputs(output_folder: str):
     """
     Print sample transactions with their debatched outputs for verification.
-    Shows: first 2 transactions + 2 transactions with empty arrays
+    Shows: 2 fully empty, 2 partial (with empty strings), 1 full (no empty strings).
     """
     print(f"\n--- Sample Outputs from {output_folder} ---")
     
@@ -235,12 +232,46 @@ def print_sample_outputs(output_folder: str):
     first_csv = os.path.join(output_folder, csv_files[0])
     df = pd.read_csv(first_csv)
     
+    fully_empty = []
+    partial_empty = []
+    full_no_empty = []
+    
+    for idx, row in df.iterrows():
+        try:
+            output_json = json.loads(row['outputs_json'])
+            
+            all_empty_arrays = True
+            has_empty_strings = False
+            has_non_empty = False
+            
+            for output in output_json.get('outputs', []):
+                data = output.get('data', [])
+                
+                if len(data) == 0:
+                    continue
+                else:
+                    all_empty_arrays = False
+                    if "" in data:
+                        has_empty_strings = True
+                    if any(val != "" for val in data):
+                        has_non_empty = True
+            
+            if all_empty_arrays:
+                fully_empty.append((idx, row))
+            elif has_empty_strings and has_non_empty:
+                partial_empty.append((idx, row))
+            elif has_non_empty and not has_empty_strings:
+                full_no_empty.append((idx, row))
+                
+        except Exception as e:
+            continue
+    
     print(f"\n{'#'*80}")
-    print("FIRST 2 TRANSACTIONS")
+    print("FULLY EMPTY TRANSACTIONS (all data arrays empty)")
     print(f"{'#'*80}")
     
-    for idx in range(min(2, len(df))):
-        row = df.iloc[idx]
+    for i in range(min(2, len(fully_empty))):
+        idx, row = fully_empty[i]
         print(f"\n{'='*80}")
         print(f"Transaction ID: {row['transaction_id']}")
         print(f"{'='*80}")
@@ -253,41 +284,45 @@ def print_sample_outputs(output_folder: str):
         print(f"\n{'='*80}")
     
     print(f"\n{'#'*80}")
-    print("TRANSACTIONS WITH EMPTY OR MINIMAL ENTITIES")
+    print("PARTIAL TRANSACTIONS (has data with empty strings)")
     print(f"{'#'*80}")
     
-    samples_found = 0
-    for idx, row in df.iterrows():
-        if samples_found >= 2:
-            break
-            
-        try:
-            output_json = json.loads(row['outputs_json'])
-            
-            # Check if any output has empty or very short data array
-            has_minimal = False
-            for output in output_json.get('outputs', []):
-                data = output.get('data', [])
-                if len(data) <= 2:
-                    has_minimal = True
-                    break
-            
-            if has_minimal:
-                print(f"\n{'='*80}")
-                print(f"Transaction ID: {row['transaction_id']}")
-                print(f"{'='*80}")
-                print(f"\nDescription: {row['description']}")
-                print(f"Memo: {row['memo']}")
-                print(f"\nDebatched Output JSON (with empty/minimal data):")
-                print(json.dumps(output_json, indent=2))
-                print(f"\n{'='*80}")
-                samples_found += 1
-                
-        except Exception as e:
-            continue
+    for i in range(min(2, len(partial_empty))):
+        idx, row = partial_empty[i]
+        print(f"\n{'='*80}")
+        print(f"Transaction ID: {row['transaction_id']}")
+        print(f"{'='*80}")
+        print(f"\nDescription: {row['description']}")
+        print(f"Memo: {row['memo']}")
+        print(f"\nDebatched Output JSON:")
+        
+        output_json = json.loads(row['outputs_json'])
+        print(json.dumps(output_json, indent=2))
+        print(f"\n{'='*80}")
     
-    if samples_found == 0:
-        print("\nNo transactions with empty/minimal data found in sample.")
+    print(f"\n{'#'*80}")
+    print("FULL TRANSACTION (no empty strings)")
+    print(f"{'#'*80}")
+    
+    if len(full_no_empty) > 0:
+        idx, row = full_no_empty[0]
+        print(f"\n{'='*80}")
+        print(f"Transaction ID: {row['transaction_id']}")
+        print(f"{'='*80}")
+        print(f"\nDescription: {row['description']}")
+        print(f"Memo: {row['memo']}")
+        print(f"\nDebatched Output JSON:")
+        
+        output_json = json.loads(row['outputs_json'])
+        print(json.dumps(output_json, indent=2))
+        print(f"\n{'='*80}")
+    
+    print(f"\n{'='*80}")
+    print("SUMMARY")
+    print(f"{'='*80}")
+    print(f"Fully empty transactions found: {len(fully_empty)}")
+    print(f"Partial transactions found: {len(partial_empty)}")
+    print(f"Full transactions found: {len(full_no_empty)}")
 
 
 def main():
