@@ -38,8 +38,8 @@ def parse_svg_path_data(d_attribute):
 def extract_axis_info(soup):
     """
     Extract x-axis and y-axis information from SVG text elements
-    (Updated to handle <tspan> children, text labels like '286.10MB',
-     and skip day labels like '11 FRI')
+    (Handles <tspan> children, text labels like '286.10MB',
+     and skips day labels like '11 FRI')
     """
     axis_info = {
         'x_labels': [],
@@ -204,6 +204,9 @@ def parse_time_label(time_str):
  
     return base_date.replace(hour=hour, minute=minute)
 
+# ===================================================================
+# THIS IS THE CORRECTED FUNCTION
+# ===================================================================
 def create_time_array(x_coords, axis_info):
     """
     Create time array from x coordinates and axis labels
@@ -231,26 +234,43 @@ def create_time_array(x_coords, axis_info):
         times = [base + duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min()) 
                  for x in x_coords]
         return np.array(times)
+
+    # --- NEW LOGIC FOR 24-HOUR 12-to-12 CYCLE ---
+    # This loop detects midnight crossings (e.g., 11 PM -> 1 AM)
+    # and adds 1 day to all subsequent labels.
+    
+    adjusted_times = []
+    current_day_offset = 0
+    
+    for i, time in enumerate(times_parsed):
+        if i > 0:
+            # if current time (e.g., 1 AM) hour is less than previous time (e.g., 11 PM) hour
+            if time.hour < times_parsed[i-1].hour:
+                current_day_offset += 1 # Increment the day
+                print(f"✓ Detected midnight crossing: {times_parsed[i-1].strftime('%I %p')} -> {time.strftime('%I %p')}")
+        
+        adjusted_times.append(time + timedelta(days=current_day_offset))
+    
+    times_parsed = adjusted_times # Overwrite with the corrected list
+    # --- END NEW LOGIC ---
+    
     
     # Interpolate times based on x coordinates
     start_time = times_parsed[0]
     end_time = times_parsed[-1]
-    
-    # Handle midnight crossing
-    if end_time < start_time:
-        print("✓ Detected midnight crossing in time labels.")
-        end_time += timedelta(days=1)
 
-    # Check if all times are the same (e.g. ['8 PM', '8 PM', ...])
-    if all(t == start_time for t in times_parsed):
-        print(f"⚠ All parsed time labels are the same ({start_time}). Using a default 2-hour duration.")
-        end_time = start_time + timedelta(hours=2)
-
-    
     print(f"Time range: {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}")
     
     # Linear interpolation
     total_duration = (end_time - start_time).total_seconds()
+    
+    # Handle case where start/end are the same (e.g., 7PM to 7PM)
+    # This was the cause of the bug
+    if total_duration == 0 and len(times_parsed) > 1:
+        print("⚠ Detected 0s duration with multiple labels. Forcing 24-hour cycle.")
+        end_time += timedelta(days=1)
+        total_duration = (end_time - start_time).total_seconds()
+        print(f"✓ Corrected time range: {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}")
     
     # Ensure we don't divide by zero if all x_coords are the same
     x_range = x_coords.max() - x_coords.min()
@@ -263,6 +283,9 @@ def create_time_array(x_coords, axis_info):
              for x in x_coords]
     
     return np.array(times)
+# ===================================================================
+# END OF CORRECTED FUNCTION
+# ===================================================================
 
 def create_memory_array(y_coords, axis_info):
     """
@@ -367,7 +390,7 @@ def plot_memory_graphs(html_file):
     x_coords, y_coords = map_coordinates_to_values(points, axis_info, viewbox)
     
     # Create time and memory arrays
-    time_array = create_time_array(x_coords, axis_info)
+    time_array = create_time_array(x_coords, axis_info) # USES NEW FIXED FUNCTION
     memory_array = create_memory_array(y_coords, axis_info)
     
     print(f"✓ Data prepared: {len(time_array)} points")
@@ -409,11 +432,9 @@ def plot_memory_graphs(html_file):
     
     # --- MODIFIED: Set axis limits based on parsed labels ---
     
-    # *** FIX ***
-    # Only set x-limits if they are different, otherwise Matplotlib freezes
+    # Only set x-limits if they are different, otherwise Matplotlib warns
     if time_axis_min != time_axis_max:
         ax1.set_xlim(time_axis_min, time_axis_max)
-    # *** END FIX ***
 
     ax1.set_ylim(y_axis_min, y_axis_max) # e.g., 0 to 572.20 * 1.05
     # --- END MODIFIED ---
@@ -424,7 +445,6 @@ def plot_memory_graphs(html_file):
     # Auto-adjust locator based on time range
     total_seconds = (time_array[-1] - time_array[0]).total_seconds()
     
-    # *** FIX ***
     # Only set a locator if there is a time duration
     if total_seconds > 0:
         if total_seconds <= 3600 * 3: # 3 hours
@@ -436,7 +456,6 @@ def plot_memory_graphs(html_file):
     else:
         # If no duration, just show the single time point
         ax1.set_xticks([time_axis_min])
-    # *** END FIX ***
 
     plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
     
@@ -520,7 +539,7 @@ def plot_memory_graphs(html_file):
     
     print("\n" + "="*70)
     print("✅ COMPLETE!")
-    print("="*70)
+    print("="*7Z)
     print(f"📊 Total data points: {len(points)}")
     print(f"📈 Graphs saved to current directory")
     print("="*70 + "\n")
