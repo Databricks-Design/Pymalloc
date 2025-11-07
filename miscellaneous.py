@@ -1,3 +1,53 @@
+def extract_axis_info(soup):
+    """
+    Extract x-axis and y-axis information from SVG text elements
+    (Updated to handle <tspan> children and text labels like '286.10MB')
+    """
+    axis_info = {
+        'x_labels': [],
+        'y_labels': [],
+        'x_positions': [],
+        'y_positions': []
+    }
+    
+    # Find all text elements
+    for text_elem in soup.find_all('text'):
+        
+        # Get position if available
+        x_pos = text_elem.get('x')
+        y_pos = text_elem.get('y')
+
+        # Find the first <tspan> inside the <text> element
+        tspan = text_elem.find('tspan')
+        
+        if tspan:
+            text_content = tspan.get_text(strip=True)
+        else:
+            # Fallback if there's no tspan
+            text_content = text_elem.get_text(strip=True)
+
+        # Check if it's a time label (for x-axis)
+        if re.search(r'\d+:\d+', text_content) or 'PM' in text_content or 'AM' in text_content:
+            axis_info['x_labels'].append(text_content)
+            if x_pos:
+                axis_info['x_positions'].append(float(x_pos))
+        
+        # Check if it's a memory label (e.g., "286.10MB", "0B")
+        elif re.search(r'(MB|GB|B)$', text_content, re.IGNORECASE):
+            # Extract just the number part
+            num_match = re.match(r'^([\d.]+)', text_content)
+            if num_match:
+                label_value = num_match.group(1) # This will be "286.10" or "0"
+                axis_info['y_labels'].append(label_value)
+                if y_pos:
+                    axis_info['y_positions'].append(float(y_pos))
+            
+    return axis_info
+
+
+
+
+
 def parse_tensor_response(self, response_json: Dict) -> List[Dict]:
     """
     De-batch the flattened tensor response into per-transaction JSON objects.
