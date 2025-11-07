@@ -35,9 +35,6 @@ def parse_svg_path_data(d_attribute):
     
     return points
 
-# ===================================================================
-# THIS FUNCTION IS UPDATED
-# ===================================================================
 def extract_axis_info(soup):
     """
     Extract x-axis and y-axis information from SVG text elements
@@ -90,9 +87,6 @@ def extract_axis_info(soup):
                     axis_info['y_positions'].append(float(y_pos))
             
     return axis_info
-# ===================================================================
-# END OF UPDATED FUNCTION
-# ===================================================================
 
 def find_memory_usage_path(soup):
     """
@@ -176,9 +170,6 @@ def map_coordinates_to_values(points, axis_info, viewbox):
     
     return x_coords, y_coords
 
-# ===================================================================
-# THIS FUNCTION IS UPDATED
-# ===================================================================
 def parse_time_label(time_str):
     """
     Parse time string to datetime object
@@ -212,9 +203,6 @@ def parse_time_label(time_str):
     if hour > 23: hour = hour % 24
  
     return base_date.replace(hour=hour, minute=minute)
-# ===================================================================
-# END OF UPDATED FUNCTION
-# ===================================================================
 
 def create_time_array(x_coords, axis_info):
     """
@@ -268,6 +256,7 @@ def create_time_array(x_coords, axis_info):
     x_range = x_coords.max() - x_coords.min()
     if x_range == 0:
         print("⚠ All X coordinates are identical. Cannot interpolate time.")
+        print("✓ This may be a single data point (vertical line).")
         return np.array([start_time] * len(x_coords))
 
     times = [start_time + timedelta(seconds=total_duration * (x - x_coords.min()) / x_range) 
@@ -322,9 +311,6 @@ def create_memory_array(y_coords, axis_info):
     
     return memory
 
-# ===================================================================
-# THIS FUNCTION IS UPDATED
-# ===================================================================
 def plot_memory_graphs(html_file):
     """
     Main function to extract and plot memory usage
@@ -367,7 +353,7 @@ def plot_memory_graphs(html_file):
     
     # Extract axis information
     print("\n📏 Extracting axis information...")
-    axis_info = extract_axis_info(soup) # USES NEW FUNCTION
+    axis_info = extract_axis_info(soup)
     print(f"✓ Found {len(axis_info['x_labels'])} x-axis labels (Note: Skipped day annotations)")
     print(f"✓ Found {len(axis_info['y_labels'])} y-axis labels")
     
@@ -381,13 +367,13 @@ def plot_memory_graphs(html_file):
     x_coords, y_coords = map_coordinates_to_values(points, axis_info, viewbox)
     
     # Create time and memory arrays
-    time_array = create_time_array(x_coords, axis_info) # USES NEW PARSE_TIME_LABEL
+    time_array = create_time_array(x_coords, axis_info)
     memory_array = create_memory_array(y_coords, axis_info)
     
     print(f"✓ Data prepared: {len(time_array)} points")
     print(f"  Memory range: {memory_array.min():.2f} - {memory_array.max():.2f} MB")
     
-    # --- NEW: Get min/max values from the *parsed labels* for setting axes ---
+    # --- Get min/max values from the *parsed labels* for setting axes ---
     y_labels_numeric = []
     for label in axis_info['y_labels']:
         try:
@@ -406,7 +392,6 @@ def plot_memory_graphs(html_file):
     # Set X-axis limits from data
     time_axis_min = time_array[0]
     time_axis_max = time_array[-1]
-    # --- END NEW ---
     
     # Create plots
     print("\n📈 Creating graphs...")
@@ -423,20 +408,35 @@ def plot_memory_graphs(html_file):
     ax1.legend(loc='upper right', fontsize=11)
     
     # --- MODIFIED: Set axis limits based on parsed labels ---
-    ax1.set_xlim(time_axis_min, time_axis_max)
+    
+    # *** FIX ***
+    # Only set x-limits if they are different, otherwise Matplotlib freezes
+    if time_axis_min != time_axis_max:
+        ax1.set_xlim(time_axis_min, time_axis_max)
+    # *** END FIX ***
+
     ax1.set_ylim(y_axis_min, y_axis_max) # e.g., 0 to 572.20 * 1.05
     # --- END MODIFIED ---
     
     # Format x-axis
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%I:%M %p'))
+    
     # Auto-adjust locator based on time range
     total_seconds = (time_array[-1] - time_array[0]).total_seconds()
-    if total_seconds <= 3600 * 3: # 3 hours
-        ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=15))
-    elif total_seconds <= 3600 * 12: # 12 hours
-        ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-    else: # More than 12 hours (like your 24hr graph)
-        ax1.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    
+    # *** FIX ***
+    # Only set a locator if there is a time duration
+    if total_seconds > 0:
+        if total_seconds <= 3600 * 3: # 3 hours
+            ax1.xaxis.set_major_locator(mdates.MinuteLocator(interval=15))
+        elif total_seconds <= 3600 * 12: # 12 hours
+            ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        else: # More than 12 hours (like your 24hr graph)
+            ax1.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    else:
+        # If no duration, just show the single time point
+        ax1.set_xticks([time_axis_min])
+    # *** END FIX ***
 
     plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
     
@@ -476,7 +476,8 @@ def plot_memory_graphs(html_file):
 
     mask = (time_array >= zoom_start) & (time_array <= zoom_end)
     
-    if mask.any():
+    # Also check if the main time array has any duration
+    if mask.any() and total_seconds > 0:
         zoom_times = time_array[mask]
         zoom_memory = memory_array[mask]
         
@@ -500,9 +501,15 @@ def plot_memory_graphs(html_file):
 
         print(f"✓ Zoomed view: {len(zoom_times)} points between 6:30-7:30 PM")
     else:
-        ax2.text(0.5, 0.5, f'No data in time range {zoom_start.strftime("%I:%M %p")} - {zoom_end.strftime("%I:%M %p")}', 
+        # Give a more specific reason
+        if total_seconds == 0:
+            msg = "Skipping zoom: Main graph has no time duration."
+        else:
+            msg = f'No data in time range {zoom_start.strftime("%I:%M %p")} - {zoom_end.strftime("%I:%M %p")}'
+        
+        ax2.text(0.5, 0.5, msg, 
                  ha='center', va='center', transform=ax2.transAxes, fontsize=14, color='red')
-        print(f"⚠ No data points in {zoom_start.strftime('%I:%M %p')} - {zoom_end.strftime('%I:%M %p')} range")
+        print(f"⚠ {msg}")
     
     plt.tight_layout()
     zoom_output = 'memory_usage_zoomed.png'
