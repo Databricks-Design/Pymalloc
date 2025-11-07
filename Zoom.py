@@ -13,6 +13,8 @@ def parse_svg_path_data(d_attribute):
     # Remove extra whitespace
     d_attribute = re.sub(r'\s+', ' ', d_attribute.strip())
     
+    # Split by commands (M, L, etc.) but keep the coordinates
+    # Pattern to match: M or L followed by coordinates
     points = []
     
     # Find all number pairs (x,y coordinates)
@@ -25,6 +27,7 @@ def parse_svg_path_data(d_attribute):
     
     if not points:
         # Try alternate parsing - space or command separated
+        # Match: number space/command number
         alt_pattern = r'([\d.]+)\s+([\d.]+)'
         matches = re.findall(alt_pattern, d_attribute)
         for x, y in matches:
@@ -32,106 +35,85 @@ def parse_svg_path_data(d_attribute):
     
     return points
 
-def extract_axis_labels_and_positions(soup):
+def extract_axis_info(soup):
     """
-    Extract x-axis and y-axis labels with their exact positions from SVG
-    Handles formats like "7 PM" and "286.16MB"
+    Extract x-axis and y-axis information from SVG text elements
+    FIXED: Now handles "7 PM" format and "286.10MB" format
     """
-    x_axis_data = []  # List of (position, label) tuples
-    y_axis_data = []  # List of (position, label) tuples
+    axis_info = {
+        'x_labels': [],
+        'y_labels': [],
+        'x_positions': [],
+        'y_positions': []
+    }
     
-    # Find all text elements in axis tick groups
-    for g_elem in soup.find_all('g', class_=lambda x: x and 'recharts-cartesian-axis-tick' in x):
-        # Get the text element
-        text_elem = g_elem.find('text')
-        if not text_elem:
-            continue
+    # Find all text elements
+    for text_elem in soup.find_all('text'):
+        text_content = text_elem.get_text(strip=True)
         
-        # Get tspan which contains the actual label
-        tspan = text_elem.find('tspan')
-        if not tspan:
-            continue
+        # Get position if available
+        x_pos = text_elem.get('x')
+        y_pos = text_elem.get('y')
         
-        label = tspan.get_text(strip=True)
+        # FIXED: Check for time labels - now handles "7 PM" format (no colon needed)
+        # Matches: "7 PM", "12 AM", "6:30 PM", etc.
+        if re.search(r'\d+\s*(AM|PM|am|pm)', text_content) or re.search(r'\d+:\d+', text_content):
+            axis_info['x_labels'].append(text_content)
+            if x_pos:
+                axis_info['x_positions'].append(float(x_pos))
         
-        # Get position from tspan or text element
-        x_pos = tspan.get('x') or text_elem.get('x')
-        y_pos = tspan.get('y') or text_elem.get('y')
-        
-        if not x_pos:
-            continue
-        
-        x_pos = float(x_pos)
-        y_pos = float(y_pos) if y_pos else 0
-        
-        # Determine if this is x-axis or y-axis based on label content
-        # X-axis: contains time indicators (PM, AM, or colon for time)
-        # Y-axis: contains MB or is just a number
-        
-        if 'MB' in label.upper() or re.match(r'^\d+\.?\d*$', label):
-            # Y-axis label (memory)
-            y_axis_data.append((y_pos, label))
-        elif 'PM' in label.upper() or 'AM' in label.upper() or ':' in label:
-            # X-axis label (time)
-            x_axis_data.append((x_pos, label))
+        # FIXED: Check for memory labels - now handles "286.10MB" format
+        # Matches: "286.10MB", "500MB", "0B", or plain numbers
+        elif re.search(r'\d+\.?\d*\s*(MB|GB|KB|B|mb|gb|kb)', text_content, re.IGNORECASE) or re.match(r'^\d+(\.\d+)?$', text_content):
+            axis_info['y_labels'].append(text_content)
+            if y_pos:
+                axis_info['y_positions'].append(float(y_pos))
+    
+    return axis_info
+
+def find_memory_usage_path(soup):
+    """
+    Find the Memory Usage path element from SVG
+    """
+    # Look for path with name="Memory Usage"
+    memory_path = soup.find('path', attrs={'name': 'Memory Usage'})
+    
+    if memory_path:
+        print("✓ Found path with name='Memory Usage'")
+        return memory_path.get('d')
+    
+    # Look for path in recharts-layer with recharts-area class
+    for g_elem in soup.find_all('g', class_=lambda x: x and 'recharts-area' in x):
+        paths = g_elem.find_all('path', class_=lambda x: x and 'recharts-curve' in x)
+        for path in paths:
+            d_attr = path.get('d')
+            if d_attr and len(d_attr) > 500:  # Memory path should be long
+                print("✓ Found path in recharts-area layer")
+                return d_attr
+    
+    # Fallback: find longest path with class containing 'curve' or 'area'
+    all_paths = soup.find_all('path')
+    candidate_paths = []
+    
+    for path in all_paths:
+        d_attr = path.get('d')
+        class_attr = path.get('class', [])
+        if isinstance(class_attr, list):
+            class_str = ' '.join(class_attr)
         else:
-            # Try to determine by position
-            # If x position is small (< 200), likely y-axis
-            # If x position is large (> 200), likely x-axis
-            if x_pos < 200:
-                y_axis_data.append((y_pos, label))
-            else:
-                x_axis_data.append((x_pos, label))
+            class_str = str(class_attr)
+        
+        if d_attr and len(d_attr) > 500:
+            if 'curve' in class_str.lower() or 'area' in class_str.lower():
+                candidate_paths.append((len(d_attr), d_attr, class_str))
     
-    # Sort by position
-    x_axis_data.sort(key=lambda x: x[0])
-    y_axis_data.sort(key=lambda x: x[0])
+    if candidate_paths:
+        # Sort by length and take longest
+        candidate_paths.sort(reverse=True)
+        print(f"✓ Found path with class: {candidate_paths[0][2]}")
+        return candidate_paths[0][1]
     
-    return x_axis_data, y_axis_data
-
-def parse_memory_label(label):
-    """
-    Parse memory label like "286.16MB" or "500" and return value in MB
-    """
-    # Remove "MB" suffix if present
-    label = label.upper().replace('MB', '').strip()
-    
-    try:
-        return float(label)
-    except:
-        return None
-
-def parse_time_label(label):
-    """
-    Parse time label like "7 PM", "6:30 PM", "12:00 AM" etc.
-    Returns datetime object
-    """
-    base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    label = label.strip()
-    
-    # Check for colon format: "6:30 PM"
-    time_match = re.search(r'(\d+):(\d+)', label)
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2))
-    else:
-        # No colon, just hour: "7 PM"
-        hour_match = re.search(r'(\d+)', label)
-        if not hour_match:
-            return None
-        hour = int(hour_match.group(1))
-        minute = 0
-    
-    # Check for PM/AM
-    if 'PM' in label.upper():
-        if hour != 12:
-            hour += 12
-    elif 'AM' in label.upper():
-        if hour == 12:
-            hour = 0
-    
-    return base_date.replace(hour=hour, minute=minute)
+    return None
 
 def extract_viewbox_dimensions(soup):
     """
@@ -150,53 +132,9 @@ def extract_viewbox_dimensions(soup):
             }
     return None
 
-def find_memory_usage_path(soup):
+def map_coordinates_to_values(points, axis_info, viewbox):
     """
-    Find the Memory Usage path element from SVG
-    """
-    # Look for path with name="Memory Usage"
-    memory_path = soup.find('path', attrs={'name': 'Memory Usage'})
-    
-    if memory_path:
-        print("✓ Found path with name='Memory Usage'")
-        return memory_path.get('d')
-    
-    # Look for path in recharts-area layer
-    for g_elem in soup.find_all('g', class_=lambda x: x and 'recharts-area' in x):
-        paths = g_elem.find_all('path', class_=lambda x: x and 'recharts-curve' in x)
-        for path in paths:
-            d_attr = path.get('d')
-            if d_attr and len(d_attr) > 500:  # Memory path should be long
-                print("✓ Found path in recharts-area layer")
-                return d_attr
-    
-    # Fallback: find longest path
-    all_paths = soup.find_all('path')
-    candidate_paths = []
-    
-    for path in all_paths:
-        d_attr = path.get('d')
-        class_attr = path.get('class', [])
-        if isinstance(class_attr, list):
-            class_str = ' '.join(class_attr)
-        else:
-            class_str = str(class_attr)
-        
-        if d_attr and len(d_attr) > 500:
-            if 'curve' in class_str.lower() or 'area' in class_str.lower():
-                candidate_paths.append((len(d_attr), d_attr, class_str))
-    
-    if candidate_paths:
-        candidate_paths.sort(reverse=True)
-        print(f"✓ Found path with class: {candidate_paths[0][2]}")
-        return candidate_paths[0][1]
-    
-    return None
-
-def map_svg_to_data_coordinates(points, x_axis_data, y_axis_data, viewbox):
-    """
-    Map SVG path coordinates to actual data values using axis labels
-    Returns: (time_array, memory_array)
+    Map SVG coordinates to actual data values using axis labels
     """
     if not points:
         return [], []
@@ -204,110 +142,145 @@ def map_svg_to_data_coordinates(points, x_axis_data, y_axis_data, viewbox):
     x_coords = np.array([p[0] for p in points])
     y_coords = np.array([p[1] for p in points])
     
-    print(f"\n📍 SVG Coordinate Ranges:")
-    print(f"   X: {x_coords.min():.2f} to {x_coords.max():.2f}")
-    print(f"   Y: {y_coords.min():.2f} to {y_coords.max():.2f}")
+    print(f"X range: {x_coords.min():.2f} to {x_coords.max():.2f}")
+    print(f"Y range: {y_coords.min():.2f} to {y_coords.max():.2f}")
     
-    # ===== Process X-axis (Time) =====
-    if not x_axis_data or len(x_axis_data) < 2:
-        print("⚠ Warning: No x-axis labels found, using default time range")
+    # Invert Y coordinates (SVG is top-down)
+    if viewbox:
+        y_coords = viewbox['height'] - y_coords
+    else:
+        y_coords = y_coords.max() - y_coords
+    
+    return x_coords, y_coords
+
+def parse_time_label(time_str):
+    """
+    Parse time string to datetime object
+    FIXED: Now handles "7 PM" format without colon
+    """
+    base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Extract hour and minute
+    time_match = re.search(r'(\d+):(\d+)', time_str)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+    else:
+        # No colon, just hour (like "7 PM")
+        hour_match = re.search(r'(\d+)', time_str)
+        if not hour_match:
+            return None
+        hour = int(hour_match.group(1))
+        minute = 0
+    
+    # Check for PM/AM
+    if 'PM' in time_str.upper() or 'pm' in time_str:
+        if hour != 12:
+            hour += 12
+    elif 'AM' in time_str.upper() or 'am' in time_str:
+        if hour == 12:
+            hour = 0
+    
+    return base_date.replace(hour=hour, minute=minute)
+
+def create_time_array(x_coords, axis_info):
+    """
+    Create time array from x coordinates and axis labels
+    """
+    if not axis_info['x_labels'] or len(axis_info['x_labels']) < 2:
+        # Fallback to simple time range
+        print("⚠ No time labels found, using default time range")
         base = datetime.now().replace(hour=18, minute=0, second=0, microsecond=0)
         duration = timedelta(hours=2)
-        time_array = np.array([base + duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min()) 
-                               for x in x_coords])
-    else:
-        print(f"\n⏰ X-axis (Time) labels found: {len(x_axis_data)}")
-        for pos, label in x_axis_data[:5]:
-            print(f"   Position {pos:.2f}: '{label}'")
-        if len(x_axis_data) > 5:
-            print(f"   ... and {len(x_axis_data) - 5} more")
-        
-        # Parse time labels
-        time_values = []
-        positions = []
-        for pos, label in x_axis_data:
-            parsed_time = parse_time_label(label)
-            if parsed_time:
-                positions.append(pos)
-                time_values.append(parsed_time)
-        
-        if len(time_values) < 2:
-            print("⚠ Warning: Could not parse time labels, using default")
-            base = datetime.now().replace(hour=18, minute=0, second=0, microsecond=0)
-            duration = timedelta(hours=2)
-            time_array = np.array([base + duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min()) 
-                                   for x in x_coords])
-        else:
-            # Handle midnight crossing
-            if time_values[-1] < time_values[0]:
-                for i in range(1, len(time_values)):
-                    if time_values[i] < time_values[i-1]:
-                        time_values[i] += timedelta(days=1)
-            
-            positions = np.array(positions)
-            time_seconds = np.array([(t - time_values[0]).total_seconds() for t in time_values])
-            
-            # Interpolate for all x coordinates
-            time_interp = np.interp(x_coords, positions, time_seconds)
-            time_array = np.array([time_values[0] + timedelta(seconds=s) for s in time_interp])
-            
-            print(f"   ✓ Time range: {time_values[0].strftime('%I:%M %p')} to {time_values[-1].strftime('%I:%M %p')}")
+        times = [base + duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min()) 
+                for x in x_coords]
+        return np.array(times)
     
-    # ===== Process Y-axis (Memory) =====
-    # SVG Y coordinates are inverted (top = 0), so we need to flip them
-    if viewbox:
-        y_coords_flipped = viewbox['height'] - y_coords
-    else:
-        y_coords_flipped = y_coords.max() - y_coords
+    # Parse time labels
+    times_parsed = []
+    for label in axis_info['x_labels']:
+        t = parse_time_label(label)
+        if t:
+            times_parsed.append(t)
     
-    if not y_axis_data or len(y_axis_data) < 2:
-        print("⚠ Warning: No y-axis labels found, normalizing to 0-1000 MB")
-        y_normalized = (y_coords_flipped - y_coords_flipped.min()) / (y_coords_flipped.max() - y_coords_flipped.min())
-        memory_array = y_normalized * 1000
-    else:
-        print(f"\n💾 Y-axis (Memory) labels found: {len(y_axis_data)}")
-        for pos, label in y_axis_data[:5]:
-            print(f"   Position {pos:.2f}: '{label}'")
-        if len(y_axis_data) > 5:
-            print(f"   ... and {len(y_axis_data) - 5} more")
-        
-        # Parse memory labels
-        memory_values = []
-        positions = []
-        for pos, label in y_axis_data:
-            parsed_mem = parse_memory_label(label)
-            if parsed_mem is not None:
-                # Y positions in SVG are also inverted
-                if viewbox:
-                    pos_flipped = viewbox['height'] - pos
-                else:
-                    # Use the max y position from the data
-                    max_y_pos = max([p[0] for p in y_axis_data])
-                    pos_flipped = max_y_pos - pos
-                positions.append(pos_flipped)
-                memory_values.append(parsed_mem)
-        
-        if len(memory_values) < 2:
-            print("⚠ Warning: Could not parse memory labels, normalizing")
-            y_normalized = (y_coords_flipped - y_coords_flipped.min()) / (y_coords_flipped.max() - y_coords_flipped.min())
-            memory_array = y_normalized * 1000
-        else:
-            positions = np.array(positions)
-            memory_values = np.array(memory_values)
-            
-            # Interpolate for all y coordinates
-            memory_array = np.interp(y_coords_flipped, positions, memory_values)
-            
-            print(f"   ✓ Memory range: {memory_values.min():.2f} MB to {memory_values.max():.2f} MB")
+    if len(times_parsed) < 2:
+        print("⚠ Could not parse time labels, using default")
+        base = datetime.now().replace(hour=18, minute=0, second=0, microsecond=0)
+        duration = timedelta(hours=2)
+        times = [base + duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min()) 
+                for x in x_coords]
+        return np.array(times)
     
-    return time_array, memory_array
+    # Interpolate times based on x coordinates
+    start_time = times_parsed[0]
+    end_time = times_parsed[-1]
+    
+    # Handle midnight crossing
+    if end_time < start_time:
+        end_time += timedelta(days=1)
+    
+    print(f"Time range: {start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}")
+    
+    # Linear interpolation
+    total_duration = (end_time - start_time).total_seconds()
+    times = [start_time + timedelta(seconds=total_duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min())) 
+            for x in x_coords]
+    
+    return np.array(times)
+
+def create_memory_array(y_coords, axis_info):
+    """
+    Create memory array from y coordinates and axis labels
+    FIXED: Now handles "286.10MB" format
+    """
+    if not axis_info['y_labels'] or len(axis_info['y_labels']) < 2:
+        # Normalize to 0-1000 MB range
+        print("⚠ No y-axis labels found, normalizing to 0-1000 MB")
+        y_normalized = (y_coords - y_coords.min()) / (y_coords.max() - y_coords.min())
+        return y_normalized * 1000
+    
+    # Parse numeric labels - FIXED: strip "MB", "GB", etc.
+    y_values = []
+    for label in axis_info['y_labels']:
+        try:
+            # Remove units (MB, GB, KB, B) and parse
+            numeric_part = re.sub(r'[A-Za-z\s]+', '', label)
+            value = float(numeric_part)
+            
+            # Convert to MB if needed
+            if 'GB' in label.upper():
+                value *= 1024
+            elif 'KB' in label.upper():
+                value /= 1024
+            elif 'B' in label.upper() and 'MB' not in label.upper():
+                value /= (1024 * 1024)
+            
+            y_values.append(value)
+        except:
+            pass
+    
+    if len(y_values) < 2:
+        print("⚠ Could not parse y-axis labels, normalizing")
+        y_normalized = (y_coords - y_coords.min()) / (y_coords.max() - y_coords.min())
+        return y_normalized * 1000
+    
+    y_min = min(y_values)
+    y_max = max(y_values)
+    
+    print(f"Memory range: {y_min:.2f} to {y_max:.2f} MB")
+    
+    # Linear mapping
+    y_normalized = (y_coords - y_coords.min()) / (y_coords.max() - y_coords.min())
+    memory = y_min + y_normalized * (y_max - y_min)
+    
+    return memory
 
 def plot_memory_graphs(html_file):
     """
-    Main function to extract and plot memory usage with correct axis mapping
+    Main function to extract and plot memory usage
     """
     print("\n" + "="*70)
-    print("MEMORY USAGE GRAPH EXTRACTOR (FIXED VERSION)")
+    print("MEMORY USAGE GRAPH EXTRACTOR")
     print("="*70)
     
     # Read HTML file
@@ -322,15 +295,6 @@ def plot_memory_graphs(html_file):
     viewbox = extract_viewbox_dimensions(soup)
     if viewbox:
         print(f"✓ ViewBox: {viewbox['width']}x{viewbox['height']}")
-    
-    # Extract axis labels and positions
-    print("\n🔍 Extracting axis labels from HTML...")
-    x_axis_data, y_axis_data = extract_axis_labels_and_positions(soup)
-    
-    if not x_axis_data:
-        print("⚠ No x-axis labels found!")
-    if not y_axis_data:
-        print("⚠ No y-axis labels found!")
     
     # Find Memory Usage path
     print("\n🔍 Searching for Memory Usage path...")
@@ -351,17 +315,27 @@ def plot_memory_graphs(html_file):
         print("✗ Not enough points found!")
         return
     
-    # Map coordinates to actual values
-    print("\n🗺️  Mapping SVG coordinates to data values...")
-    time_array, memory_array = map_svg_to_data_coordinates(points, x_axis_data, y_axis_data, viewbox)
+    # Extract axis information
+    print("\n📏 Extracting axis information...")
+    axis_info = extract_axis_info(soup)
+    print(f"✓ Found {len(axis_info['x_labels'])} x-axis labels")
+    print(f"✓ Found {len(axis_info['y_labels'])} y-axis labels")
     
-    if len(time_array) == 0 or len(memory_array) == 0:
-        print("✗ Failed to map coordinates!")
-        return
+    if axis_info['x_labels']:
+        print(f"  Time labels: {axis_info['x_labels'][:5]}...")
+    if axis_info['y_labels']:
+        print(f"  Memory labels: {axis_info['y_labels'][:5]}...")
     
-    print(f"\n✓ Data prepared: {len(time_array)} points")
+    # Map coordinates
+    print("\n🗺️  Mapping coordinates to values...")
+    x_coords, y_coords = map_coordinates_to_values(points, axis_info, viewbox)
+    
+    # Create time and memory arrays
+    time_array = create_time_array(x_coords, axis_info)
+    memory_array = create_memory_array(y_coords, axis_info)
+    
+    print(f"✓ Data prepared: {len(time_array)} points")
     print(f"  Memory range: {memory_array.min():.2f} - {memory_array.max():.2f} MB")
-    print(f"  Time range: {time_array[0].strftime('%I:%M %p')} - {time_array[-1].strftime('%I:%M %p')}")
     
     # Create plots
     print("\n📈 Creating graphs...")
@@ -387,13 +361,15 @@ def plot_memory_graphs(html_file):
     plt.savefig(full_output, dpi=300, bbox_inches='tight')
     print(f"✓ Saved: {full_output}")
     
-    # Figure 2: Zoomed view (middle hour)
+    # Figure 2: Zoomed view (6:30 PM - 7:30 PM)
     fig2, ax2 = plt.subplots(figsize=(16, 6))
     
-    # Calculate zoom range (middle hour of data)
-    total_duration = (time_array[-1] - time_array[0]).total_seconds()
-    zoom_start = time_array[0] + timedelta(seconds=total_duration * 0.25)
-    zoom_end = time_array[0] + timedelta(seconds=total_duration * 0.75)
+    zoom_start = datetime.now().replace(hour=18, minute=30, second=0, microsecond=0)
+    zoom_end = datetime.now().replace(hour=19, minute=30, second=0, microsecond=0)
+    
+    # Handle midnight crossing
+    if time_array[-1] < time_array[0]:
+        zoom_end += timedelta(days=1)
     
     mask = (time_array >= zoom_start) & (time_array <= zoom_end)
     
@@ -406,7 +382,7 @@ def plot_memory_graphs(html_file):
                 markersize=4, markevery=max(1, len(zoom_times)//50))
         ax2.set_xlabel('Time', fontsize=13, fontweight='bold')
         ax2.set_ylabel('Memory Usage (MB)', fontsize=13, fontweight='bold')
-        ax2.set_title(f'Memory Usage - Magnified View ({zoom_start.strftime("%I:%M %p")} - {zoom_end.strftime("%I:%M %p")})', 
+        ax2.set_title('Memory Usage - Magnified View (6:30 PM - 7:30 PM)', 
                      fontsize=15, fontweight='bold', pad=20)
         ax2.grid(True, alpha=0.3, linestyle='--', linewidth=0.7)
         ax2.legend(loc='upper right', fontsize=11)
@@ -418,11 +394,11 @@ def plot_memory_graphs(html_file):
         
         ax2.set_xlim(zoom_start, zoom_end)
         
-        print(f"✓ Zoomed view: {len(zoom_times)} points")
+        print(f"✓ Zoomed view: {len(zoom_times)} points between 6:30-7:30 PM")
     else:
-        ax2.text(0.5, 0.5, 'No data in zoom range', 
+        ax2.text(0.5, 0.5, 'No data in time range 6:30 PM - 7:30 PM', 
                 ha='center', va='center', transform=ax2.transAxes, fontsize=14, color='red')
-        print("⚠ No data points in zoom range")
+        print("⚠ No data points in 6:30-7:30 PM range")
     
     plt.tight_layout()
     zoom_output = 'memory_usage_zoomed.png'
@@ -435,9 +411,7 @@ def plot_memory_graphs(html_file):
     print("✅ COMPLETE!")
     print("="*70)
     print(f"📊 Total data points: {len(points)}")
-    print(f"📈 Graphs saved:")
-    print(f"   - {full_output}")
-    print(f"   - {zoom_output}")
+    print(f"📈 Graphs saved to current directory")
     print("="*70 + "\n")
 
 # Main execution
