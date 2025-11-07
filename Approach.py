@@ -204,11 +204,14 @@ def parse_time_label(time_str):
  
     return base_date.replace(hour=hour, minute=minute)
 
+# ===================================================================
+# THIS FUNCTION IS THE FIX (v9)
+# ===================================================================
 def create_time_array(x_coords, axis_info):
     """
     Create time array from x coordinates.
-    This version finds the first and last *visible* labels (by sorting)
-    and assumes a 24-hour window if they are the same.
+    This version de-duplicates the 129 labels to find the ~24 visible ones
+    by ROUNDING the pixel position to group them.
     """
     # Check if we have both labels and positions
     if not axis_info['x_labels'] or not axis_info['x_positions'] or \
@@ -221,15 +224,17 @@ def create_time_array(x_coords, axis_info):
                  for x in x_coords]
         return np.array(times)
 
-    # --- NEW "24-HOUR WINDOW" LOGIC ---
-    # Zip positions and labels to find unique pairs
+    # --- "DE-DUPLICATION" LOGIC (THE FIX) ---
+    # Use ROUNDED position as the key to group labels
     unique_labels_map = {}
     for x_pos, label in zip(axis_info['x_positions'], axis_info['x_labels']):
-        if x_pos not in unique_labels_map:
-            unique_labels_map[x_pos] = label
+        rounded_pos = round(x_pos) # THIS IS THE FIX
+        unique_labels_map[rounded_pos] = label # Keeps the *last* label found at this spot
             
     # Convert map to a list of (pos, label) tuples and sort by position
     paired_list = sorted(unique_labels_map.items())
+    print(f"✓ Found {len(paired_list)} unique, sorted time labels (e.g., {paired_list[0][1]}... {paired_list[-1][1]})")
+    # --- END "DE-DUPLICATION" LOGIC ---
     
     if len(paired_list) < 2:
         print("⚠ Not enough *unique* x-axis labels found, using default time range")
@@ -257,11 +262,9 @@ def create_time_array(x_coords, axis_info):
     # This is the key: if start and end are the same (e.g., "7 PM"), 
     # assume it's a 24-hour window.
     if end_time <= start_time:
-        print("✓ Detected 24-hour window (e.g., 7 PM to 7 PM).")
+        print(f"✓ Detected 24-hour window ({start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}).")
         end_time += timedelta(days=1)
     
-    # --- END NEW LOGIC ---
-
     print(f"Time range: {start_time.strftime('%I:%M %p, %b %d')} to {end_time.strftime('%I:%M %p, %b %d')}")
     
     # Linear interpolation
@@ -277,18 +280,22 @@ def create_time_array(x_coords, axis_info):
     
     return np.array(times)
 
+# ===================================================================
+# THIS FUNCTION IS ALSO THE FIX (v9)
+# ===================================================================
 def create_memory_array(y_coords, axis_info):
     """
     Create memory array from y coordinates and axis labels
+    This version uses ROUNDING to de-duplicate labels.
     """
-    # --- Deduplicate Y-labels by position ---
+    # --- Deduplicate Y-labels by position (THE FIX) ---
     unique_y_labels = {}
     for y_pos, label in zip(axis_info['y_positions'], axis_info['y_labels']):
-        if y_pos not in unique_y_labels:
-            unique_y_labels[y_pos] = label
+        rounded_pos = round(y_pos) # THIS IS THE FIX
+        unique_y_labels[rounded_pos] = label # Overwrites, keeping the last one
     
     sorted_y_labels = [label for pos, label in sorted(unique_y_labels.items())]
-    print(f"✓ Found {len(sorted_y_labels)} unique y-axis labels.")
+    print(f"✓ Found {len(sorted_y_labels)} unique y-axis labels (e.g., {sorted_y_labels[:5]}...)")
     # --- END ---
     
     if not sorted_y_labels or len(sorted_y_labels) < 2:
