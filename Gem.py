@@ -118,7 +118,7 @@ def find_memory_usage_path(soup):
         if isinstance(class_attr, list):
             class_str = ' '.join(class_attr)
         else:
-            class_str = str(class_attr)
+            class_str = str(class_str)
         
         if d_attr and len(d_attr) > 500:
             if 'curve' in class_str.lower() or 'area' in class_str.lower():
@@ -211,45 +211,59 @@ def create_time_array(x_coords, axis_info):
     """
     Create time array from x coordinates and axis labels
     """
-    if not axis_info['x_labels'] or len(axis_info['x_labels']) < 2:
-        # Fallback to simple time range
-        print("⚠ No time labels found, using default time range")
+    # Check if we have both labels and positions
+    if not axis_info['x_labels'] or not axis_info['x_positions'] or \
+       len(axis_info['x_labels']) < 2 or len(axis_info['x_positions']) < 2:
+        
+        print("⚠ Not enough x-axis labels or positions found, using default time range")
         base = datetime.now().replace(hour=18, minute=0, second=0, microsecond=0)
         duration = timedelta(hours=2)
         times = [base + duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min()) 
                  for x in x_coords]
         return np.array(times)
     
-    # Parse time labels
+    # --- NEW: Sort labels by their X-position ---
+    # Zip positions and labels together
+    paired_list = list(zip(axis_info['x_positions'], axis_info['x_labels']))
+    # Sort by position (the first item in the tuple)
+    paired_list.sort()
+    # Unzip back into a sorted list of labels
+    sorted_labels = [label for pos, label in paired_list]
+    print(f"✓ Sorted time labels: {sorted_labels[:5]}... to ...{sorted_labels[-5:]}")
+    # --- END NEW ---
+
+    # Parse time labels from the *sorted* list
     times_parsed = []
-    for label in axis_info['x_labels']:
+    for label in sorted_labels:
         t = parse_time_label(label) # Uses new, robust parser
         if t:
             times_parsed.append(t)
     
     if len(times_parsed) < 2:
-        print(f"⚠ Could not parse time labels ({axis_info['x_labels']}), using default")
+        print(f"⚠ Could not parse time labels ({sorted_labels}), using default")
         base = datetime.now().replace(hour=18, minute=0, second=0, microsecond=0)
         duration = timedelta(hours=2)
         times = [base + duration * (x - x_coords.min()) / (x_coords.max() - x_coords.min()) 
                  for x in x_coords]
         return np.array(times)
 
-    # --- NEW LOGIC FOR 24-HOUR 12-to-12 CYCLE ---
+    # --- Logic for 24-HOUR 12-to-12 CYCLE ---
     # This loop detects midnight crossings (e.g., 11 PM -> 1 AM)
     # and adds 1 day to all subsequent labels.
     
     adjusted_times = []
     current_day_offset = 0
+    last_hour = -1
     
-    for i, time in enumerate(times_parsed):
-        if i > 0:
-            # if current time (e.g., 1 AM) hour is less than previous time (e.g., 11 PM) hour
-            if time.hour < times_parsed[i-1].hour:
-                current_day_offset += 1 # Increment the day
-                print(f"✓ Detected midnight crossing: {times_parsed[i-1].strftime('%I %p')} -> {time.strftime('%I %p')}")
+    for time in times_parsed:
+        current_hour = time.hour
+        if last_hour != -1 and current_hour < last_hour:
+             # e.g., current is 1 (1 AM) and last was 23 (11 PM)
+            current_day_offset += 1 
+            print(f"✓ Detected midnight crossing: {last_hour}:00 -> {current_hour}:00")
         
         adjusted_times.append(time + timedelta(days=current_day_offset))
+        last_hour = current_hour
     
     times_parsed = adjusted_times # Overwrite with the corrected list
     # --- END NEW LOGIC ---
@@ -539,7 +553,7 @@ def plot_memory_graphs(html_file):
     
     print("\n" + "="*70)
     print("✅ COMPLETE!")
-    print("="*7Z)
+    print("="*70)
     print(f"📊 Total data points: {len(points)}")
     print(f"📈 Graphs saved to current directory")
     print("="*70 + "\n")
