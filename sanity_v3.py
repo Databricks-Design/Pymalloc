@@ -42,7 +42,8 @@ class APITester:
     def parse_tensor_response(self, response_json: Dict) -> List[Dict]:
         """
         De-batch the flattened tensor response into per-transaction JSON objects.
-        Preserves datatype and shape fields. Keeps empty strings only if data has non-empty values.
+        If any output has entities: keep all values including empty strings for all outputs.
+        If all outputs empty: use empty arrays for all outputs.
         """
         outputs = response_json.get('outputs', [])
         if not outputs:
@@ -66,6 +67,10 @@ class APITester:
         for i in range(batch_size):
             transaction_outputs = []
             
+            # First pass: extract all data and check if transaction has any non-empty entities
+            temp_data = []
+            transaction_has_entities = False
+            
             for output_info in output_list:
                 transaction_data = []
                 
@@ -74,16 +79,26 @@ class APITester:
                     value = output_info['data'][idx] if idx < len(output_info['data']) else ""
                     transaction_data.append(value)
                 
-                has_non_empty = any(val != "" for val in transaction_data)
+                temp_data.append(transaction_data)
                 
-                if not has_non_empty:
-                    transaction_data = []
+                # Check if this output has any non-empty value
+                if any(val != "" for val in transaction_data):
+                    transaction_has_entities = True
+            
+            # Second pass: build outputs based on whether transaction has entities
+            for output_idx, output_info in enumerate(output_list):
+                if transaction_has_entities:
+                    # Keep all values including empty strings
+                    data = temp_data[output_idx]
+                else:
+                    # All empty - use empty array
+                    data = []
                 
                 transaction_outputs.append({
                     "name": output_info['name'],
                     "datatype": output_info['datatype'],
-                    "shape": [1, len(transaction_data)],
-                    "data": transaction_data
+                    "shape": [1, len(data)],
+                    "data": data
                 })
             
             transaction_json = {
