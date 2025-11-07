@@ -1,79 +1,70 @@
-def print_sample_outputs(output_folder: str):
+def parse_tensor_response(self, response_json: Dict) -> List[Dict]:
     """
-    Print sample transactions with their debatched outputs for verification.
-    Shows: first 2 transactions + 2 transactions with empty string padding
+    De-batch the flattened tensor response into per-transaction JSON objects.
+    If any output has entities: keep all values including empty strings for all outputs.
+    If all outputs empty: use empty arrays for all outputs.
     """
-    print(f"\n--- Sample Outputs from {output_folder} ---")
+    outputs = response_json.get('outputs', [])
+    if not outputs:
+        return []
     
-    # Read the first output CSV file
-    csv_files = sorted([f for f in os.listdir(output_folder) if f.startswith('output_part_')])
-    if not csv_files:
-        print("No output files found!")
-        return
+    shape = outputs[0].get('shape', [])
+    if len(shape) != 2:
+        return []
     
-    first_csv = os.path.join(output_folder, csv_files[0])
-    df = pd.read_csv(first_csv)
+    batch_size, max_entities = shape
     
-    # Print first 2 transactions
-    print(f"\n{'#'*80}")
-    print("FIRST 2 TRANSACTIONS")
-    print(f"{'#'*80}")
+    output_list = []
+    for output in outputs:
+        output_list.append({
+            'name': output['name'],
+            'datatype': output.get('datatype', 'BYTES'),
+            'data': output['data']
+        })
     
-    for idx in range(min(2, len(df))):
-        row = df.iloc[idx]
-        print(f"\n{'='*80}")
-        print(f"Transaction ID: {row['transaction_id']}")
-        print(f"{'='*80}")
-        print(f"\nDescription: {row['description']}")
-        print(f"Memo: {row['memo']}")
-        print(f"\nDebatched Output JSON:")
+    results = []
+    for i in range(batch_size):
+        transaction_outputs = []
         
-        output_json = json.loads(row['outputs_json'])
-        print(json.dumps(output_json, indent=2))
-        print(f"\n{'='*80}")
-    
-    # Find transactions with empty strings in outputs
-    print(f"\n{'#'*80}")
-    print("TRANSACTIONS WITH EMPTY STRING PADDING (NULL VALUES)")
-    print(f"{'#'*80}")
-    
-    samples_found = 0
-    for idx, row in df.iterrows():
-        if samples_found >= 2:
-            break
+        # First pass: extract all data and check if transaction has any non-empty entities
+        temp_data = []
+        transaction_has_entities = False
+        
+        for output_info in output_list:
+            transaction_data = []
             
-        try:
-            output_json = json.loads(row['outputs_json'])
+            for j in range(max_entities):
+                idx = i * max_entities + j
+                value = output_info['data'][idx] if idx < len(output_info['data']) else ""
+                transaction_data.append(value)
             
-            # Check if any output has empty strings
-            has_empty = False
-            for output in output_json.get('outputs', []):
-                data = output.get('data', [])
-                if '' in data:
-                    has_empty = True
-                    break
+            temp_data.append(transaction_data)
             
-            if has_empty:
-                print(f"\n{'='*80}")
-                print(f"Transaction ID: {row['transaction_id']}")
-                print(f"{'='*80}")
-                print(f"\nDescription: {row['description']}")
-                print(f"Memo: {row['memo']}")
-                print(f"\nDebatched Output JSON (with empty strings):")
-                print(json.dumps(output_json, indent=2))
-                print(f"\n{'='*80}")
-                samples_found += 1
-                
-        except Exception as e:
-            continue
+            # Check if this output has any non-empty value
+            if any(val != "" for val in transaction_data):
+                transaction_has_entities = True
+        
+        # Second pass: build outputs based on whether transaction has entities
+        for output_idx, output_info in enumerate(output_list):
+            if transaction_has_entities:
+                # Keep all values including empty strings
+                data = temp_data[output_idx]
+            else:
+                # All empty - use empty array
+                data = []
+            
+            transaction_outputs.append({
+                "name": output_info['name'],
+                "datatype": output_info['datatype'],
+                "shape": [1, len(data)],
+                "data": data
+            })
+        
+        transaction_json = {
+            "model_name": response_json.get('model_name', ''),
+            "model_version": response_json.get('model_version', ''),
+            "outputs": transaction_outputs
+        }
+        results.append(transaction_json)
     
-    if samples_found == 0:
-        print("\nNo transactions with empty string padding found in sample.")
-
-
-# Updated main() function with the new print_sample_outputs call:
-
-
-    print_sample_outputs('output/api_1')
-    
-    
+    return results
